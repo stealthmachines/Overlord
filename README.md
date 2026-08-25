@@ -1,14 +1,59 @@
 # remote_agent
 
-A two-stage x86 boot image for a real Gigabyte B450M DS3H (RTL8168 NIC)
-that brings up the NIC itself from bare metal — no OS, no drivers — and
-sits in a persistent command loop answering a raw-Ethernet control
-protocol from a Windows host. Boots either from disk (MBR) or legacy PXE;
-both paths run the identical stage2. Once running, the host can read
-arbitrary physical memory, write it, dump/decode the BIOS ROM and its
-SMBIOS/ACPI/PCI structures, read/write raw disk sectors, and remotely
-reboot or reflash the box — all over the network, no physical access to
-the target machine required after the first boot.
+**A machine you can reach when the OS is gone.**
+
+`remote_agent` is a ~16KB x86 program that *is* the operating system, for
+one purpose: give you a persistent, network-reachable command channel
+into a real physical machine, running before, instead of, and completely
+independent of Windows, Linux, or anything else that would normally sit
+between you and the hardware. It boots off a USB stick or over legacy
+PXE, brings up the NIC itself with hand-written driver code, and then
+just... sits there, forever, answering a raw-Ethernet protocol: read any
+physical address, write any physical address, read/write raw disk
+sectors, dump and decode the BIOS, enumerate every PCI device and every
+ACPI table, reboot the box, or push a whole new image to it and have it
+reboot into that instead — all from a Python REPL on another machine, no
+keyboard or monitor on the target required after the very first boot.
+
+## Why this is different from "normal" remote management
+
+Server hardware has IPMI/BMC chips for this. Consumer boards don't. This
+project builds the equivalent — a true out-of-band control channel — out
+of nothing but a boot sector, on hardware that was never designed to
+have one. The agent isn't a program running *under* an OS that could
+crash, get patched, get compromised, or simply not have booted yet — it
+*is* the entire execution environment. There's no kernel to panic, no
+driver stack to fail, no login screen to get past. If the CPU is
+running, the agent is what's running on it.
+
+That also means it sees things a normal remote-management story never
+would: raw BIOS ROM content, the real SMBIOS/DMI tables, the actual ACPI
+tables the platform hands the OS, arbitrary physical memory, at an
+address you choose, with nothing between your request and the hardware.
+
+## Use cases
+
+- **Out-of-band management for boards without a BMC.** Reboot a
+  headless/remote machine, inspect its state, or push a new disk image
+  to it over the network — even if whatever OS was on it is unbootable,
+  corrupted, or was never installed at all.
+- **Hardware archaeology / reverse engineering.** Full read-only maps of
+  SMBIOS, ACPI (RSDT/XSDT → every table, FADT/MADT/MCFG decoded), and
+  PCI config space (including walking bridge chains to devices that
+  aren't even on bus 0) — from a board's *actual* firmware, not a
+  datasheet.
+- **Bare-metal / low-level education.** A complete, working, from-scratch
+  example of PCI enumeration, MMIO, a real NIC brought up by hand (RTL8168,
+  MDIO/PHY access included), protected-mode transition, and a real
+  request/reply network protocol — all in one relatively small, readable
+  codebase, with the full round-by-round history kept so you can see
+  *how* it was built, not just the final state.
+- **Recovery tooling.** When a machine won't boot into its real OS, this
+  still can — from a spare USB slot or PXE — and gives you memory and
+  disk access to diagnose or fix it remotely.
+- **Fleet provisioning with an actual back-channel.** PXE normally means
+  "one-shot install and hope." This keeps a live control channel open
+  after boot instead of handing off to an installer and disappearing.
 
 ## Layout
 
@@ -32,6 +77,61 @@ VERSIONS/   Unified diffs between every consecutive round (stage2_N_to_M
 release/    Latest working build: remote_agent_19.img (disk) and
             remote_agent_pxe_19.nbp (PXE). Rebuild any round yourself
             with `nasm -f bin boot_N.asm -o boot_N.bin` etc. (see Building).
+```
+
+## Getting started
+
+**What you need:** two machines connected by a plain Ethernet cable (a
+switch works too — everything here is broadcast-based, no IP needed at
+all) or a PXE-capable network; a USB stick if you're going the disk-boot
+route; [NASM](https://www.nasm.us/) to assemble; Python 3.10+ with
+`scapy` (`pip install scapy`) on the *controller* machine.
+
+**1. Flash or serve the image.**
+- Disk boot: write `release/remote_agent_19.img` raw to a USB stick (Rufus
+  in "DD image" mode on Windows, or `dd if=remote_agent_19.img
+  of=/dev/sdX` on Linux — get the device letter right, this overwrites
+  the whole disk) and boot the target from it.
+- PXE boot: serve `release/remote_agent_pxe_19.nbp` over TFTP and point
+  your DHCP/PXE server's boot filename at it. No disk write on the
+  target at all.
+
+**2. Point `remote_control.py` at the right NIC.** Open
+`tools/remote_control.py` and set `IFACE` to the *controller* machine's
+network adapter name (on Windows, whatever `Get-NetAdapter` calls it —
+e.g. `"Ethernet 8"`; on Linux, `eth0`/`enp3s0`/etc.).
+
+**3. Run it elevated.** On Windows this has to be an Administrator
+terminal — Npcap silently no-ops raw frame send/receive without it, and
+the failure mode (every call times out, no error message) looks exactly
+like a dead cable. This is the single most common "it's not working"
+cause; check it first.
+
+**4. Boot the target and talk to it:**
+
+```python
+import remote_control as rc
+
+rc.ping()                        # sanity check -- should echo back instantly
+rc.read32(0xF0000)               # one dword from physical memory
+rc.read_block(0xF0000, 368)      # up to 368 dwords in one round trip
+rc.reboot()                      # remote power-cycle, no hands on the box needed
+```
+
+For anything more than a quick one-off, wrap it in the keepalive (see
+*Known issues* — the link has been observed to go idle-dead otherwise):
+
+```python
+with rc.Keepalive():
+    rc.read_block(0xF0000, 368)
+    # ... whatever else, however long it takes ...
+```
+
+**5. Try the higher-level tools** once basic `ping()` works:
+
+```bash
+python tools/dump_and_decode_bios.py        # BIOS ROM + SMBIOS decode
+python tools/bios_mapper.py --json out.json # full SMBIOS + ACPI + PCI map
 ```
 
 ## Wire protocol
@@ -58,23 +158,6 @@ broadcast frames, opcode-addressed:
 `WRITE32` is **not** range-restricted in firmware — anything vetting
 which addresses are safe to write happens on the host side, in whatever
 script calls `remote_control.py`.
-
-## Quick start
-
-```python
-import remote_control as rc      # set IFACE to your NIC's Windows name first
-rc.ping()                        # sanity check
-rc.read32(0xF0000)               # one dword
-rc.read_block(0xF0000, 368)      # up to 368 dwords in one round trip
-rc.reboot()                      # remote power-cycle, no hands needed
-
-with rc.Keepalive():             # see "Known issues" below -- start this
-    rc.read_block(0xF0000, 368)  # before any real work
-```
-
-**Must run elevated (Administrator) on Windows** — raw frame TX/RX via
-Npcap silently no-ops on some setups without it, and the symptom (every
-call times out, no error) looks exactly like a dead link.
 
 ## Building
 
