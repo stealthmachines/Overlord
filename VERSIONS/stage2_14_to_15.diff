@@ -1,0 +1,64 @@
+--- stage2_14.asm	2026-08-25 09:47:16.787055400 -0600
++++ stage2_15.asm	2026-08-25 09:47:16.795411400 -0600
+@@ -634,6 +634,21 @@
+     pop edx
+     ret
+ 
++; EBX=bus, ECX=device, EDX=function, ESI=register, EDI=value -> writes dword.
++; build_pci_addr only reads ebx/ecx/edx/esi (clobbers eax/ebp), so edi
++; survives the call untouched -- same pattern as pci_read32, just with the
++; data direction reversed on the CFC port.
++pci_write32:
++    call build_pci_addr
++    push edx
++    mov dx, PCI_CONFIG_ADDR
++    out dx, eax
++    mov dx, PCI_CONFIG_DATA
++    mov eax, edi
++    out dx, eax
++    pop edx
++    ret
++
+ ; =============================================================================
+ ; Find TARGET_VENDOR:TARGET_DEVICE, decode its BAR2 (64-bit MMIO), and dump
+ ; the RTL8139/8169/8168-family-stable register set. Entirely read-only.
+@@ -699,6 +714,31 @@
+     push ecx
+     push edx
+ 
++    ; 2026-08-24: PXE was just enabled in BIOS for the first time in this
++    ; project's history. A PXE option ROM runs before we ever get control,
++    ; and it's well documented that PXE ROMs commonly clear PCI Bus Master
++    ; Enable on the NIC before handing off to the next boot device (so
++    ; their own in-flight DMA can't keep scribbling into RAM post-handoff).
++    ; Every prior round assumed BIOS/POST leaves Memory Space + Bus Master
++    ; enabled by default -- true for a normal cold boot, no longer
++    ; guaranteed now that something else touches this device first. A
++    ; ChipCmd software reset (do_reset, below) doesn't restore PCI config
++    ; space, only internal ASIC state -- so this has to be reasserted here,
++    ; explicitly, every time, rather than assumed.
++    mov esi, 0x04
++    call pci_read32
++    or eax, 0x00000006      ; bit1=Memory Space Enable, bit2=Bus Master Enable
++    mov edi, eax
++    mov esi, 0x04
++    call pci_write32
++
++    mov esi, busmaster_msg
++    call print32
++    mov esi, 0x04
++    call pci_read32
++    call print_hex32
++    call emit_newline
++
+     ; BAR2 at config offset 0x18
+     mov esi, 0x18
+     call pci_read32
+@@ -2186,6 +2226,7 @@
+ phyar_label:        db 'PHYAR    @0x60 (4B)  = 0x', 0
+ phystatus_label:    db 'PHYstatus@0x6C (1B)  = 0x', 0
+ 
++busmaster_msg:      db 10, 'Forcing PCI COMMAND (Memory Space + Bus Master) enabled -- now = 0x', 0
+ before_reset_hdr:   db 10, '-- BEFORE RESET --', 10, 0
+ rxdvgate_msg:       db 10, 'Clearing RXDV_GATED_EN (MISC bit 19 @0xF0) -- unblocks RX at the PHY/MAC boundary...', 10, 0
+ after_reset_hdr:     db 10, '-- AFTER RESET --', 10, 0

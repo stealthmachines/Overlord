@@ -1,0 +1,187 @@
+--- stage2_3.asm	2026-08-25 09:47:16.623607700 -0600
++++ stage2_4.asm	2026-08-25 09:47:16.637058300 -0600
+@@ -120,6 +120,175 @@
+ 
+ BITS 32
+ 
++; =============================================================================
++; EXCEPTION HANDLING -- added 2026-08-23 after five separate real-hardware
++; incidents this session where a plain MMIO read into previously-unswept
++; GPU BAR0 territory froze the ENTIRE machine (network dead, everything
++; dead), each requiring a physical power-cycle to recover. Root cause
++; never confirmed with certainty, but this environment NEVER set up an
++; IDT at all (only a GDT) -- meaning if the hardware ever DOES raise a
++; synchronous CPU exception on a bad bus access (a real, common outcome on
++; x86 for many classes of invalid access), there is no handler for it,
++; which triple-faults the CPU. Most platforms handle a triple fault as an
++; internal CPU reset -- consistent with what looks like "the machine hung"
++; from outside. This is the actual fix real GPU drivers rely on: catch the
++; fault instead of avoiding it. If it works, it turns every future hazard
++; hit into a reported, recoverable error instead of a lost machine.
++;
++; IMPORTANT: this block must live AFTER "BITS 32", not before it. It was
++; first written above the BITS 32 line by mistake -- NASM would have
++; assembled `push dword` here using 16-bit-context assumptions, inserting
++; an 0x66 operand-size prefix that, when actually executed by the CPU
++; already running in a 32-bit code segment, TOGGLES AWAY from 32-bit
++; instead of confirming it, silently pushing the wrong-sized value. Caught
++; before assembling, not left as a latent bug.
++;
++; Every one of the 32 CPU-reserved exception vectors gets a stub that
++; pushes its vector number (plus a dummy 0 for vectors that don't already
++; get a hardware error code, so the common handler always sees the same
++; stack shape), then jumps to one shared handler. The handler does NOT
++; attempt to resume the faulting instruction (several of these exceptions,
++; notably #MC, are documented ABORT-class faults where the saved return
++; address is not reliable to resume from) -- it reports which vector fired
++; and its error code over the same output channels as everything else,
++; then deliberately abandons whatever was interrupted: resets the stack to
++; the same safe value pm_start uses and jumps straight back into
++; remote_loop, which re-arms the RX descriptor and waits for the next
++; command fresh. CR4.MCE (bit 6) is also enabled so a real hardware
++; machine-check condition raises vector 18 through this same path instead
++; of an uncaught machine-check shutdown cycle.
++; =============================================================================
++
++%macro ISR_NOERR 1
++isr_stub_%1:
++    push dword 0
++    push dword %1
++    jmp common_isr
++%endmacro
++
++%macro ISR_ERR 1
++isr_stub_%1:
++    push dword %1
++    jmp common_isr
++%endmacro
++
++ISR_NOERR 0
++ISR_NOERR 1
++ISR_NOERR 2
++ISR_NOERR 3
++ISR_NOERR 4
++ISR_NOERR 5
++ISR_NOERR 6
++ISR_NOERR 7
++ISR_ERR   8
++ISR_NOERR 9
++ISR_ERR   10
++ISR_ERR   11
++ISR_ERR   12
++ISR_ERR   13
++ISR_ERR   14
++ISR_NOERR 15
++ISR_NOERR 16
++ISR_ERR   17
++ISR_NOERR 18
++ISR_NOERR 19
++ISR_NOERR 20
++ISR_NOERR 21
++ISR_NOERR 22
++ISR_NOERR 23
++ISR_NOERR 24
++ISR_NOERR 25
++ISR_NOERR 26
++ISR_NOERR 27
++ISR_NOERR 28
++ISR_NOERR 29
++ISR_NOERR 30
++ISR_NOERR 31
++
++common_isr:
++    pusha
++    mov eax, [esp + 32]     ; vector number (pushed last, so it's on top
++                             ; of the 8 pusha'd registers, 32 bytes above)
++    mov ebx, [esp + 36]     ; error code (0 if the vector doesn't have one)
++
++    mov esi, exc_msg
++    call print32
++    call print_hex32         ; print32/print_hex32 both preserve all
++    mov esi, exc_err_label    ; general registers via their own pusha/popa,
++    call print32               ; so eax/ebx still hold vector/error here
++    mov eax, ebx
++    call print_hex32
++    call emit_newline
++
++    ; Deliberately do NOT iret -- abandon the interrupted context entirely
++    ; (several of these vectors are documented ABORT-class faults with an
++    ; unreliable return address) and recover into the command loop fresh.
++    mov esp, 0x90000
++    jmp remote_loop
++
++; Every stub lives well under 64KB (ORG 0x8000, whole image ~16KB), so the
++; offset's high word is always exactly 0 -- hardcoded rather than computed,
++; sidesteps a NASM issue applying & / >> directly to a label in this
++; context (-f bin flat binary, label used inside a macro-generated dw).
++%macro IDT_ENTRY 1
++    dw %1
++    dw CODE_SEG
++    db 0
++    db 0x8E
++    dw 0
++%endmacro
++
++idt_start:
++IDT_ENTRY isr_stub_0
++IDT_ENTRY isr_stub_1
++IDT_ENTRY isr_stub_2
++IDT_ENTRY isr_stub_3
++IDT_ENTRY isr_stub_4
++IDT_ENTRY isr_stub_5
++IDT_ENTRY isr_stub_6
++IDT_ENTRY isr_stub_7
++IDT_ENTRY isr_stub_8
++IDT_ENTRY isr_stub_9
++IDT_ENTRY isr_stub_10
++IDT_ENTRY isr_stub_11
++IDT_ENTRY isr_stub_12
++IDT_ENTRY isr_stub_13
++IDT_ENTRY isr_stub_14
++IDT_ENTRY isr_stub_15
++IDT_ENTRY isr_stub_16
++IDT_ENTRY isr_stub_17
++IDT_ENTRY isr_stub_18
++IDT_ENTRY isr_stub_19
++IDT_ENTRY isr_stub_20
++IDT_ENTRY isr_stub_21
++IDT_ENTRY isr_stub_22
++IDT_ENTRY isr_stub_23
++IDT_ENTRY isr_stub_24
++IDT_ENTRY isr_stub_25
++IDT_ENTRY isr_stub_26
++IDT_ENTRY isr_stub_27
++IDT_ENTRY isr_stub_28
++IDT_ENTRY isr_stub_29
++IDT_ENTRY isr_stub_30
++IDT_ENTRY isr_stub_31
++idt_end:
++
++idt_descriptor:
++    dw idt_end - idt_start - 1
++    dd idt_start
++
++exc_msg:       db 10, '*** EXCEPTION vector=0x', 0
++exc_err_label: db ' err=0x', 0
++
++setup_idt_and_mce:
++    pusha
++    lidt [idt_descriptor]
++    mov eax, cr4
++    or eax, 0x40            ; CR4.MCE -- enable machine-check exceptions
++    mov cr4, eax
++    popa
++    ret
++
+ pm_start:
+     mov ax, DATA_SEG
+     mov ds, ax
+@@ -129,6 +298,8 @@
+     mov ss, ax
+     mov esp, 0x90000
+ 
++    call setup_idt_and_mce
++
+     call serial_init
+     call clear_screen
+     call log_init

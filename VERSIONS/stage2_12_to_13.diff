@@ -1,0 +1,205 @@
+--- stage2_12.asm	2026-08-25 09:47:16.751742700 -0600
++++ stage2_13.asm	2026-08-25 09:47:16.756775700 -0600
+@@ -1161,20 +1161,6 @@
+ RX_DESC_BUF_SIZE   equ 0x3FFF   ; descriptor opts1 field value (14-bit max)
+ RX_MAX_SIZE        equ 0x4000   ; RxMaxSize register value
+ 
+-; Real multi-descriptor RX ring (round 11) -- replaces the single-descriptor
+-; design that hung the whole machine on bursts as small as 5 unacked frames
+-; (client fires faster than the CPU can drain+re-arm one descriptor, NIC has
+-; nowhere to DMA the next frame). Each slot must still be the full 16KB
+-; buffer round 5 already found this hardware requires (a smaller "just big
+-; enough for one frame" buffer got zero RX activity at all) -- so the ring
+-; is N separate 16KB buffers, not N smaller ones. Placed in the one clean
+-; unused gap in the existing memory map (0x10000-0x20000, before the log
+-; region at 0x20000-0x28000) -- doesn't move anything else.
+-RX_RING_COUNT      equ 4
+-RX_RING_BUF_ADDR   equ 0x10000   ; 4 * 0x4000 = 0x10000, ends exactly at
+-                                  ; 0x20000 where LOG_LINEAR begins
+-rx_cur: dd 0
+-
+ ; =============================================================================
+ ; REMOTE_LOOP — persistent command loop. Replaces the one-shot RX echo
+ ; test: instead of receiving one frame and halting, this re-arms the RX
+@@ -1252,38 +1238,17 @@
+     mov esi, remote_loop_hdr
+     call print32
+ 
+-    ; ── One-time ring setup: arm all RX_RING_COUNT descriptors, each
+-    ; pointing at its own 16KB buffer, EOR set only on the last one so the
+-    ; NIC wraps back to descriptor 0. Done once here, not every iteration --
+-    ; the ring persists; only the consumed slot gets re-armed per frame. ──
+-    xor ecx, ecx
+-.rx_ring_init:
++.next_command:
++    ; ── Re-arm the RX descriptor: hand hardware a fresh empty buffer ──
+     mov edi, RX_DESC_ADDR
+-    mov eax, ecx
+-    shl eax, 4
+-    add edi, eax
+-
+     mov eax, 0x80000000
+-    or  eax, RX_DESC_BUF_SIZE
+-    cmp ecx, RX_RING_COUNT - 1
+-    jne .rx_init_not_last
+     or  eax, 0x40000000
+-.rx_init_not_last:
++    or  eax, RX_DESC_BUF_SIZE
+     mov [edi], eax
+     mov dword [edi+4], 0
+-
+-    mov eax, ecx
+-    shl eax, 14
+-    add eax, RX_RING_BUF_ADDR
+-    mov [edi+8], eax
++    mov dword [edi+8], RX_BUF_ADDR
+     mov dword [edi+12], 0
+ 
+-    inc ecx
+-    cmp ecx, RX_RING_COUNT
+-    jne .rx_ring_init
+-
+-    mov dword [rx_cur], 0
+-
+     mov ebp, [mmio_base]
+     mov dword [ebp+0xE4], RX_DESC_ADDR
+     mov dword [ebp+0xE8], 0
+@@ -1292,55 +1257,11 @@
+     or al, 0x08
+     mov [ebp+0x37], al
+ 
+-.next_command:
+ .wait_loop:
+-    mov edi, RX_DESC_ADDR
+-    mov eax, [rx_cur]
+-    shl eax, 4
+-    add edi, eax
+-    mov eax, [edi]
++    mov eax, [RX_DESC_ADDR]
+     test eax, 0x80000000
+     jnz .wait_loop
+ 
+-    ; Frame ready in ring slot [rx_cur] -- copy it into the fixed RX_BUF_ADDR
+-    ; working buffer so every opcode handler below (unchanged, reads fixed
+-    ; RX_BUF_ADDR+N offsets) keeps working exactly as before.
+-    mov eax, [rx_cur]
+-    shl eax, 14
+-    add eax, RX_RING_BUF_ADDR
+-    mov esi, eax
+-    mov edi, RX_BUF_ADDR
+-    mov ecx, 384        ; 1536 bytes -- comfortably covers the ~1507-byte max frame
+-    rep movsd
+-
+-    ; Re-arm just this slot, then advance to the next one.
+-    mov edi, RX_DESC_ADDR
+-    mov eax, [rx_cur]
+-    mov ebx, eax
+-    shl eax, 4
+-    add edi, eax
+-    mov eax, 0x80000000
+-    or  eax, RX_DESC_BUF_SIZE
+-    cmp ebx, RX_RING_COUNT - 1
+-    jne .rx_rearm_not_last
+-    or  eax, 0x40000000
+-.rx_rearm_not_last:
+-    mov [edi], eax
+-    mov dword [edi+4], 0   ; BUG FIX (round 12): the original single-
+-                            ; descriptor code always cleared this status
+-                            ; field on every re-arm; the ring version only
+-                            ; did it in one-time init, leaving stale NIC-
+-                            ; written status on every slot's 2nd+ reuse --
+-                            ; matches the exact observed hang threshold
+-                            ; (burst of RX_RING_COUNT+1 = 5 frames)
+-
+-    inc dword [rx_cur]
+-    mov eax, [rx_cur]
+-    cmp eax, RX_RING_COUNT
+-    jne .rx_cur_ok
+-    mov dword [rx_cur], 0
+-.rx_cur_ok:
+-
+     movzx eax, byte [RX_BUF_ADDR + 14]   ; opcode
+     cmp al, 0x01
+     je .do_read32
+@@ -1358,6 +1279,10 @@
+     je .do_disk_write_sectors
+     cmp al, 0x08
+     je .do_disk_read_sectors
++    cmp al, 0x09
++    je .do_get_boot_drive
++    cmp al, 0x0A
++    je .do_reboot
+ 
+     mov esi, remote_got_msg
+     call print32
+@@ -1640,6 +1565,70 @@
+     call remote_send_diskwrite_reply   ; same reply shape works for both
+     jmp .next_command
+ 
++.do_get_boot_drive:
++    ; request: no fields beyond the opcode byte. Returns the physical drive
++    ; number BIOS booted THIS image from (captured by boot.asm's stage 1
++    ; into DL at boot time, left at fixed address 0x7000) -- lets the
++    ; network client discover which drive to target for a self-flash
++    ; without guessing or hardcoding a drive number.
++    movzx eax, byte [0x7000]
++    mov [remote_disk_drive], eax
++
++    call remote_build_eth_header
++    mov byte [TX_BUF_ADDR+14], 0x89
++    mov al, [remote_disk_drive]
++    mov [TX_BUF_ADDR+15], al
++
++    mov edi, TX_BUF_ADDR+16
++    mov eax, TX_BUF_ADDR + 14 + 46
++    sub eax, edi
++    mov ecx, eax
++    xor al, al
++    rep stosb
++
++    call remote_send_frame
++    jmp .next_command
++
++.do_reboot:
++    ; request: bytes1-4 = magic 0xDEADC0DE, must match exactly -- cheap
++    ; guard against a stray/malformed frame triggering a reboot. This is
++    ; the actual "flash on-the-fly" mechanism: after the client has used
++    ; GET_BOOT_DRIVE + STAGE_WRITE_BLOCK + DISK_WRITE_SECTORS (all already
++    ; proven, unchanged) to write a new boot image to LBA 0 of this box's
++    ; own boot drive, this reboots straight into it over the network -- no
++    ; physical re-flash, no manual power cycle.
++    mov eax, [RX_BUF_ADDR + 15]
++    cmp eax, 0xDEADC0DE
++    jne .next_command
++
++    call remote_build_eth_header
++    mov byte [TX_BUF_ADDR+14], 0x8A
++
++    mov edi, TX_BUF_ADDR+15
++    mov eax, TX_BUF_ADDR + 14 + 46
++    sub eax, edi
++    mov ecx, eax
++    xor al, al
++    rep stosb
++
++    call remote_send_frame     ; already blocks until the NIC's TX
++                                ; descriptor OWN bit clears, i.e. the ack
++                                ; frame has genuinely left the NIC
++
++    mov ecx, 0x0FFFFFFF         ; small extra margin before resetting
++.reboot_delay:
++    loop .reboot_delay
++
++.reboot_wait_kbc:
++    in al, 0x64
++    test al, 0x02
++    jnz .reboot_wait_kbc
++    mov al, 0xFE                ; 8042 keyboard controller: pulse reset line
++    out 0x64, al
++.reboot_hang:
++    hlt
++    jmp .reboot_hang
++
+ remote_addr:  dd 0
+ remote_value: dd 0
+ remote_count: dd 0

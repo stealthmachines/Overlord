@@ -1,0 +1,40 @@
+--- stage2_7.asm	2026-08-25 09:47:16.685935000 -0600
++++ stage2_8.asm	2026-08-25 09:47:16.699720100 -0600
+@@ -1519,7 +1519,28 @@
+ 
+     mov byte [disk_op_ah], 0x42     ; extended READ, not write
+ 
++    mov esi, remote_diskread_msg
++    call print32
++    mov eax, [remote_disk_drive]
++    call print_hex32
++    mov esi, remote_lba_label
++    call print32
++    mov eax, [remote_write_lba_lo]
++    call print_hex32
++    mov esi, remote_count_label
++    call print32
++    mov eax, [remote_write_count]
++    call print_hex32
++    call emit_newline
++
+     call bios_disk_call
++
++    mov esi, remote_diskread_result_msg
++    call print32
++    movzx eax, byte [disk_op_carry]
++    call print_hex32
++    call emit_newline
++
+     call remote_send_diskwrite_reply   ; same reply shape works for both
+     jmp .next_command
+ 
+@@ -2087,6 +2108,8 @@
+ remote_diskwrite_msg:       db '  *** DISK_WRITE drive=0x', 0
+ remote_lba_label:           db ' lba=0x', 0
+ remote_diskwrite_result_msg: db '  DISK_WRITE carry=0x', 0
++remote_diskread_msg:        db '  *** DISK_READ drive=0x', 0
++remote_diskread_result_msg: db '  DISK_READ carry=0x', 0
+ 
+ rx_echo_prefix: db 'ECHO:', 0
+ rx_echo_prefix_len equ ($ - rx_echo_prefix) - 1

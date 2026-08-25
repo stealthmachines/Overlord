@@ -1,0 +1,40 @@
+--- stage2_9.asm	2026-08-25 09:47:16.711500400 -0600
++++ stage2_10.asm	2026-08-25 09:47:16.725281800 -0600
+@@ -1585,17 +1585,26 @@
+ STAGE_BUF_ADDR    equ 0x40000
+ STAGE_BUF_SEGMENT equ 0x4000     ; STAGE_BUF_ADDR >> 4 -- segment-aligned,
+                                   ; so the DAP's buffer offset is always 0
+-MAX_STAGE_DWORDS  equ 256        ; per STAGE_WRITE_BLOCK call, matches
+-                                  ; READ_BLOCK's own sizing (1024 bytes,
+-                                  ; safely under the Ethernet MTU)
+-MAX_WRITE_SECTORS equ 128        ; per DISK_WRITE_SECTORS commit call =
+-                                  ; 64KB = exactly STAGE_BUF's size --
+-                                  ; conservative, widely-supported single-
+-                                  ; BIOS-call size for extended INT13h writes
+-MAX_BLOCK_COUNT equ 256   ; 256 dwords = 1024 data bytes; total frame
+-                          ; (14 hdr + 1 op + 4 addr + 2 count + 1024 data)
+-                          ; = 1045 bytes, comfortably under the 1500-byte
+-                          ; standard Ethernet MTU
++MAX_STAGE_DWORDS  equ 368        ; per STAGE_WRITE_BLOCK call (1472 data
++                                  ; bytes); total frame = 14 hdr + 1 op +
++                                  ; 4 offset + 2 count + 1472 data = 1493
++                                  ; bytes, just under the 1500-byte standard
++                                  ; Ethernet MTU -- was 256 (1024B), the
++                                  ; actual frame-usage fix moved the
++                                  ; bottleneck from per-frame waits (fixed
++                                  ; client-side) to frame count, so bigger
++                                  ; frames now matter
++MAX_WRITE_SECTORS equ 512        ; per DISK_WRITE_SECTORS commit call =
++                                  ; 256KB (was 128 sectors = 64KB) -- the
++                                  ; 128-sector cap was an arbitrary firmware
++                                  ; choice, not a real INT13h/DAP limit (DAP
++                                  ; sector count is a 16-bit field); staging
++                                  ; buffer grown to match, still well clear
++                                  ; of the stack (0x90000) and VGA hole
++                                  ; (0xA0000)
++MAX_BLOCK_COUNT equ 368   ; matches MAX_STAGE_DWORDS -- 368 dwords = 1472
++                          ; data bytes, frame total 1493 bytes, just under
++                          ; the 1500-byte standard Ethernet MTU
+ 
+ ; Fills TX_BUF_ADDR[0..13] with dst=broadcast/src=our real MAC (read live
+ ; from IDR0-5)/EtherType=0x88B5. Caller fills the payload afterward.

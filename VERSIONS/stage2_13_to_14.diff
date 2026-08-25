@@ -1,0 +1,40 @@
+--- stage2_13.asm	2026-08-25 09:47:16.756775700 -0600
++++ stage2_14.asm	2026-08-25 09:47:16.787055400 -0600
+@@ -1574,6 +1574,16 @@
+     movzx eax, byte [0x7000]
+     mov [remote_disk_drive], eax
+ 
++    ; settle cycles before the reply -- same fix as rounds 8/9 (a reply
++    ; fired immediately after a fast RAM-only op was never recognized on
++    ; the wire on real hardware; a few real cycles of debug output first
++    ; fixes it every time)
++    mov esi, remote_bootdrive_msg
++    call print32
++    mov eax, [remote_disk_drive]
++    call print_hex32
++    call emit_newline
++
+     call remote_build_eth_header
+     mov byte [TX_BUF_ADDR+14], 0x89
+     mov al, [remote_disk_drive]
+@@ -1601,6 +1611,11 @@
+     cmp eax, 0xDEADC0DE
+     jne .next_command
+ 
++    ; settle cycles before the reply -- same fix as GET_BOOT_DRIVE above
++    mov esi, remote_reboot_msg
++    call print32
++    call emit_newline
++
+     call remote_build_eth_header
+     mov byte [TX_BUF_ADDR+14], 0x8A
+ 
+@@ -2204,6 +2219,8 @@
+ remote_diskwrite_result_msg: db '  DISK_WRITE carry=0x', 0
+ remote_diskread_msg:        db '  *** DISK_READ drive=0x', 0
+ remote_diskread_result_msg: db '  DISK_READ carry=0x', 0
++remote_bootdrive_msg:       db '  BOOT_DRIVE=0x', 0
++remote_reboot_msg:          db '  *** REBOOT requested ***', 0
+ remote_stagewrite_msg:      db '  STAGEWR offset=0x', 0
+ 
+ rx_echo_prefix: db 'ECHO:', 0

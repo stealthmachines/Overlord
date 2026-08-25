@@ -1,0 +1,237 @@
+--- stage2_4.asm	2026-08-25 09:47:16.637058300 -0600
++++ stage2_5.asm	2026-08-25 09:47:16.646327400 -0600
+@@ -1271,6 +1271,8 @@
+     je .do_read_block
+     cmp al, 0x04
+     je .do_pci_read
++    cmp al, 0x05
++    je .do_disk_get_params
+ 
+     mov esi, remote_got_msg
+     call print32
+@@ -1370,6 +1372,22 @@
+     call remote_send_pciread_reply
+     jmp .next_command
+ 
++.do_disk_get_params:
++    movzx eax, byte [RX_BUF_ADDR + 15]
++    mov [remote_disk_drive], eax
++    mov al, [remote_disk_drive]
++    mov [disk_op_drive], al
++
++    mov esi, remote_diskparams_msg
++    call print32
++    mov eax, [remote_disk_drive]
++    call print_hex32
++    call emit_newline
++
++    call remote_disk_get_params
++    call remote_send_diskparams_reply
++    jmp .next_command
++
+ remote_addr:  dd 0
+ remote_value: dd 0
+ remote_count: dd 0
+@@ -1379,6 +1397,7 @@
+ remote_pci_func: dd 0
+ remote_pci_reg: dd 0
+ remote_pci_value: dd 0
++remote_disk_drive: dd 0
+ MAX_BLOCK_COUNT equ 256   ; 256 dwords = 1024 data bytes; total frame
+                           ; (14 hdr + 1 op + 4 addr + 2 count + 1024 data)
+                           ; = 1045 bytes, comfortably under the 1500-byte
+@@ -1616,6 +1635,186 @@
+     popa
+     ret
+ 
++; =============================================================================
++; BIOS DISK CALL BRIDGE -- added 2026-08-23. Round-trips from 32-bit
++; protected mode down to 16-bit real mode, performs ONE BIOS INT 13h disk
++; call, and returns to protected mode with the result -- reuses the exact
++; real-mode-reentry pattern this file already proved works (save_log_and_
++; halt / pm16_entry / real_mode_entry, used for the one-shot boot-log
++; write), just made ROUND-TRIP instead of one-shot, and driven by a
++; parameter block instead of a hardcoded log write.
++;
++; CRITICAL: pusha pushes onto whatever ESP was at call time (the flat
++; 32-bit stack), but real mode below sets its own SP (0x7C00) to have a
++; valid stack for the BIOS call -- that permanently clobbers ESP unless
++; explicitly saved and restored. Caught before this ran anywhere:
++; saved_esp holds the real value across the whole excursion, restored
++; right before popa on the way back. Getting this wrong would corrupt the
++; return address on a stack popa reads from a completely different
++; location than the one pusha wrote to.
++;
++; Caller fills disk_op_ah / disk_op_drive / disk_op_buffer (a BIOS-
++; function-dependent structure -- a get-params buffer for AH=0x48, a DAP
++; for AH=0x42/0x43) BEFORE calling. On return: disk_op_carry holds the
++; carry flag (0=success, 1=BIOS reported an error) and disk_op_ax holds
++; AX after the call (some BIOS functions also return an error code there).
++; =============================================================================
++saved_esp:      dd 0
++disk_op_ah:     db 0
++disk_op_drive:  db 0
++disk_op_carry:  db 0
++disk_op_ax:     dw 0
++disk_op_buffer: times 32 db 0
++
++bios_disk_call:
++    pusha
++    mov [saved_esp], esp
++    jmp CODE16_SEG:.pm16
++
++BITS 16
++.pm16:
++    mov ax, DATA16_SEG
++    mov ds, ax
++    mov es, ax
++    mov fs, ax
++    mov gs, ax
++    mov ss, ax
++
++    mov eax, cr0
++    and eax, 0xFFFFFFFE
++    mov cr0, eax
++
++    jmp 0x0000:.real16
++
++.real16:
++    xor ax, ax
++    mov ds, ax
++    mov es, ax
++    mov ss, ax
++    mov sp, 0x7C00
++    sti                     ; CRITICAL, missed on the first pass -- BIOS
++                             ; disk routines commonly rely on interrupt-
++                             ; driven timing internally; without this the
++                             ; call hangs forever with IF still clear from
++                             ; earlier in boot. The proven original real_
++                             ; mode_entry code already does this; this new
++                             ; routine didn't, and hung in QEMU testing
++                             ; exactly as expected before ever reaching
++                             ; real hardware.
++
++    ; CRITICAL: point IDTR at the real-mode IVT (base 0, limit 0x3FF)
++    ; before any INT instruction here. setup_idt_and_mce (this session's
++    ; exception-handling work) loads OUR OWN protected-mode IDT via lidt
++    ; early in boot -- IDTR does NOT automatically revert when CR0.PE is
++    ; cleared, so without this, `int 0x13` below would misinterpret our
++    ; 8-byte-per-entry protected-mode IDT as 4-byte real-mode vectors and
++    ; jump into garbage instead of BIOS's real INT13h handler. This is
++    ; exactly what hung in QEMU testing before this fix -- checkpoints
++    ; through right-before-int13 fired cleanly, then nothing, because the
++    ; CPU jumped somewhere with no path back. The old one-shot log-write
++    ; code never needed this because it never touched lidt at all -- IDTR
++    ; was still at its post-reset default (base 0), which happens to
++    ; coincide with the real IVT.
++    lidt [real_ivt_descriptor]
++
++    mov si, disk_op_buffer
++    mov ah, [disk_op_ah]
++    mov dl, [disk_op_drive]
++    int 0x13
++    mov [disk_op_ax], ax
++    jnc .ok
++    mov byte [disk_op_carry], 1
++    jmp .back_to_pm
++
++.ok:
++    mov byte [disk_op_carry], 0
++
++.back_to_pm:
++    cli
++    lgdt [gdt_descriptor]
++    mov eax, cr0
++    or eax, 1
++    mov cr0, eax
++    jmp CODE_SEG:.pm32
++
++BITS 32
++.pm32:
++    mov ax, DATA_SEG
++    mov ds, ax
++    mov es, ax
++    mov fs, ax
++    mov gs, ax
++    mov ss, ax
++    mov esp, [saved_esp]
++    ; restore OUR OWN protected-mode IDT -- real_ivt_descriptor above is
++    ; only valid while genuinely in real mode; without switching back,
++    ; any exception from here on would misinterpret the real IVT's 4-byte
++    ; entries as 8-byte protected-mode gate descriptors and crash instead
++    ; of being caught.
++    lidt [idt_descriptor]
++    popa
++    ret
++
++real_ivt_descriptor:
++    dw 0x3FF        ; limit: 256 vectors * 4 bytes - 1
++    dd 0x00000000   ; base: the real-mode IVT always lives at physical 0
++
++; =============================================================================
++; opcode 0x05 DISK_GET_PARAMS -- read-only drive enumeration. Request:
++; byte1=drive number (0x80, 0x81, 0x82, ... standard BIOS drive numbering).
++; Reply: byte0=0x85, byte1=drive (echoed), byte2=carry flag (0=drive
++; exists and responded, 1=BIOS reported an error -- almost always means
++; this drive number doesn't exist), bytes3-4=AX after the call,
++; bytes5-12=total sector count (8 bytes, BIOS EDD get-params buffer offset
++; 0x10), bytes13-14=bytes per sector (2 bytes, buffer offset 0x18).
++; Nothing here writes anything -- BIOS function 0x48 (get extended drive
++; parameters) is read-only by definition.
++; =============================================================================
++remote_disk_get_params:
++    pusha
++    ; zero the get-params buffer and set its size field (0x1E), per the
++    ; BIOS EDD spec -- the buffer size must be pre-filled before the call
++    mov edi, disk_op_buffer
++    mov ecx, 8
++    xor eax, eax
++    rep stosd
++    mov word [disk_op_buffer], 0x1E
++
++    mov byte [disk_op_ah], 0x48
++    ; disk_op_drive already set by the caller
++
++    call bios_disk_call
++    popa
++    ret
++
++remote_send_diskparams_reply:
++    pusha
++    call remote_build_eth_header
++    mov byte [TX_BUF_ADDR+14], 0x85
++    mov al, [remote_disk_drive]
++    mov [TX_BUF_ADDR+15], al
++    mov al, [disk_op_carry]
++    mov [TX_BUF_ADDR+16], al
++    mov ax, [disk_op_ax]
++    mov [TX_BUF_ADDR+17], ax
++    mov eax, [disk_op_buffer+0x10]      ; total sectors, low dword
++    mov [TX_BUF_ADDR+19], eax
++    mov eax, [disk_op_buffer+0x14]      ; total sectors, high dword
++    mov [TX_BUF_ADDR+23], eax
++    mov ax, [disk_op_buffer+0x18]       ; bytes per sector
++    mov [TX_BUF_ADDR+27], ax
++
++    mov edi, TX_BUF_ADDR+29
++    mov eax, TX_BUF_ADDR + 14 + 46
++    sub eax, edi
++    mov ecx, eax
++    xor al, al
++    rep stosb
++
++    call remote_send_frame
++    popa
++    ret
++
+ nic_dump_exit:
+     pop edx
+     pop ecx
+@@ -1680,6 +1879,7 @@
+ remote_readblock_msg: db '  READBLK 0x', 0
+ remote_count_label:   db ' count=0x', 0
+ remote_pciread_msg:   db '  PCIREAD = 0x', 0
++remote_diskparams_msg: db '  DISKPARAMS drive=0x', 0
+ 
+ rx_echo_prefix: db 'ECHO:', 0
+ rx_echo_prefix_len equ ($ - rx_echo_prefix) - 1

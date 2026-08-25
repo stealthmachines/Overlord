@@ -1,0 +1,60 @@
+--- stage2_6.asm	2026-08-25 09:47:16.673091400 -0600
++++ stage2_7.asm	2026-08-25 09:47:16.685935000 -0600
+@@ -1277,6 +1277,8 @@
+     je .do_stage_write_block
+     cmp al, 0x07
+     je .do_disk_write_sectors
++    cmp al, 0x08
++    je .do_disk_read_sectors
+ 
+     mov esi, remote_got_msg
+     call print32
+@@ -1479,6 +1481,48 @@
+     call remote_send_diskwrite_reply
+     jmp .next_command
+ 
++.do_disk_read_sectors:
++    ; request: byte15=drive, bytes16-23=LBA, bytes24-25=sector count
++    ; (<=MAX_WRITE_SECTORS). Reads FROM disk INTO STAGE_BUF_ADDR via BIOS
++    ; INT13h AH=0x42 (extended read, read-only w.r.t. the disk). The
++    ; actual data is retrieved separately via read_block() against
++    ; STAGE_BUF_ADDR's physical address (0x40000) -- reuses the existing
++    ; bulk-read mechanism instead of duplicating it here.
++    movzx eax, byte [RX_BUF_ADDR + 15]
++    mov [remote_disk_drive], eax
++    mov al, [remote_disk_drive]
++    mov [disk_op_drive], al
++
++    mov eax, [RX_BUF_ADDR + 16]
++    mov [remote_write_lba_lo], eax
++    mov eax, [RX_BUF_ADDR + 20]
++    mov [remote_write_lba_hi], eax
++
++    movzx eax, word [RX_BUF_ADDR + 24]
++    cmp eax, MAX_WRITE_SECTORS
++    jbe .read_count_ok
++    mov eax, MAX_WRITE_SECTORS
++.read_count_ok:
++    mov [remote_write_count], eax
++
++    mov edi, disk_op_buffer
++    mov byte [edi+0], 0x10
++    mov byte [edi+1], 0
++    mov ax, [remote_write_count]
++    mov [edi+2], ax
++    mov word [edi+4], 0x0000
++    mov word [edi+6], STAGE_BUF_SEGMENT
++    mov eax, [remote_write_lba_lo]
++    mov [edi+8], eax
++    mov eax, [remote_write_lba_hi]
++    mov [edi+12], eax
++
++    mov byte [disk_op_ah], 0x42     ; extended READ, not write
++
++    call bios_disk_call
++    call remote_send_diskwrite_reply   ; same reply shape works for both
++    jmp .next_command
++
+ remote_addr:  dd 0
+ remote_value: dd 0
+ remote_count: dd 0

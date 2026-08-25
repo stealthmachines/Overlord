@@ -1,0 +1,58 @@
+--- stage2_18.asm	2026-08-25 09:47:16.835517000 -0600
++++ stage2_19.asm	2026-08-25 09:47:16.851458100 -0600
+@@ -1296,6 +1296,7 @@
+ ; Matching both exactly, rather than assuming "big enough for one Ethernet
+ ; frame" was sufficient -- it evidently wasn't.
+ ; =============================================================================
++RX_WAIT_POLL_LIMIT equ 200000000 ; round 19: bounded RX wait, see remote_loop
+ RX_DESC_ADDR       equ 0x32000
+ RX_BUF_ADDR        equ 0x33000
+ RX_DESC_BUF_SIZE   equ 0x3FFF   ; descriptor opts1 field value (14-bit max)
+@@ -1415,11 +1416,38 @@
+     or al, 0x08
+     mov [ebp+0x37], al
+ 
++    ; round 19 fix: this wait used to be an UNBOUNDED spin -- if the RX
++    ; engine ever stopped delivering a new frame into this one descriptor
++    ; (for any reason: this is exactly the class of bug that round 17
++    ; fixed on the TX side -- silently trusting hardware to come back
++    ; with no timeout, no recovery), the CPU would sit here forever,
++    ; genuinely frozen, not just quiet -- matching what real-hardware
++    ; testing actually showed (frozen mid-screen, not a clean idle
++    ; state). Bounded now: on timeout, force the RX engine to re-arm
++    ; itself (ChipCmd CmdRxEnb off then on) instead of trusting it'll
++    ; recover on its own, then go re-arm the descriptor and wait again.
++    ; This also means a healthy-but-idle agent self-refreshes its own
++    ; RX engine periodically even with no incoming traffic at all,
++    ; instead of relying purely on staying externally busy.
++    mov ecx, RX_WAIT_POLL_LIMIT
+ .wait_loop:
+     mov eax, [RX_DESC_ADDR]
+     test eax, 0x80000000
+-    jnz .wait_loop
++    jz .got_frame
++    loop .wait_loop
+ 
++    mov esi, rx_recover_msg
++    call print32
++    mov ebp, [mmio_base]
++    movzx eax, byte [ebp+0x37]
++    and al, 0xF7                ; clear CmdRxEnb (bit3)
++    mov [ebp+0x37], al
++    movzx eax, byte [ebp+0x37]
++    or al, 0x08                 ; set CmdRxEnb again
++    mov [ebp+0x37], al
++    jmp .next_command
++
++.got_frame:
+     movzx eax, byte [RX_BUF_ADDR + 14]   ; opcode
+     cmp al, 0x01
+     je .do_read32
+@@ -2396,6 +2424,7 @@
+ remote_loop_hdr: db 10, '-- REMOTE COMMAND LOOP (persistent; PING/READ32/WRITE32) --', 10, 0
+ rcr_fix_msg:     db 'RCR accept-bits forced (APM|AM|AB) -- now 0x', 0
+ tx_send_failed_msg: db '  TX FAILED -- OWN bit never cleared after ', 0
++rx_recover_msg:      db '  RX WAIT TIMEOUT -- recycling CmdRxEnb and re-arming...', 10, 0
+ remote_got_msg:  db '  Command received: ', 0
+ remote_read_msg:  db '  READ32  0x', 0
+ remote_write_msg: db '  WRITE32 0x', 0

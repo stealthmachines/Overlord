@@ -1,0 +1,34 @@
+--- stage2_8.asm	2026-08-25 09:47:16.699720100 -0600
++++ stage2_9.asm	2026-08-25 09:47:16.711500400 -0600
+@@ -1414,6 +1414,23 @@
+     mov ecx, [remote_stage_count]
+     rep movsd
+ 
++    ; Settle cycles before the reply -- mirrors the DISK_READ_SECTORS fix
++    ; (round 8): a real-hardware-only bug where a reply fired immediately
++    ; after a fast RAM-only operation was never recognized on the wire,
++    ; while operations with real BIOS-call latency in front of their reply
++    ; were always fine. Same symptom here (STAGE_WRITE_BLOCK's rep movsd is
++    ; even faster than a plain register copy), same fix: burn a few real
++    ; cycles via debug prints between the operation and remote_send_frame.
++    mov esi, remote_stagewrite_msg
++    call print32
++    mov eax, [remote_stage_offset]
++    call print_hex32
++    mov esi, remote_count_label
++    call print32
++    mov eax, [remote_stage_count]
++    call print_hex32
++    call emit_newline
++
+     call remote_send_stagewrite_reply
+     jmp .next_command
+ 
+@@ -2110,6 +2127,7 @@
+ remote_diskwrite_result_msg: db '  DISK_WRITE carry=0x', 0
+ remote_diskread_msg:        db '  *** DISK_READ drive=0x', 0
+ remote_diskread_result_msg: db '  DISK_READ carry=0x', 0
++remote_stagewrite_msg:      db '  STAGEWR offset=0x', 0
+ 
+ rx_echo_prefix: db 'ECHO:', 0
+ rx_echo_prefix_len equ ($ - rx_echo_prefix) - 1

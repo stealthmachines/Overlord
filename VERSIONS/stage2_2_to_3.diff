@@ -1,0 +1,116 @@
+--- stage2_2.asm	2026-08-25 09:47:16.610019300 -0600
++++ stage2_3.asm	2026-08-25 09:47:16.623607700 -0600
+@@ -1009,6 +1009,21 @@
+ ;                          bytes5-8=value read back AFTER the write --
+ ;                          reporting what's actually there now, not just
+ ;                          echoing what was sent
++;     0x04 PCI_CONFIG_READ: byte1=bus, byte2=device, byte3=function,
++;                   byte4=config register (byte offset, must be dword-
++;                   aligned, e.g. 0x18 for BAR2) -- reuses this firmware's
++;                   own pci_read32 (already proven correct: it's exactly
++;                   how this project's own PCI scan found the real NIC and
++;                   the real GPU's BAR0/BAR3 sizes originally). Added
++;                   2026-08-23 specifically to find the GPU's real VRAM
++;                   aperture base address (BAR2/BAR3 pair) before ever
++;                   attempting to write real image content into VRAM --
++;                   the emulator's own VRAM_BAR constant is a placeholder,
++;                   never a confirmed real address, and writing blind
++;                   without knowing where VRAM actually is would be
++;                   reckless given this project's history.
++;                   reply: byte0=0x84, byte1-4=bus/device/function/register
++;                   (echoed), bytes5-8=the 32-bit config dword read
+ ;     0x03 READ_BLOCK: bytes 1-4 = start address, bytes 5-6 = dword count
+ ;                   (16-bit, clamped to MAX_BLOCK_COUNT server-side --
+ ;                   caller can tell a clamp happened by checking the
+@@ -1083,6 +1098,8 @@
+     je .do_write32
+     cmp al, 0x03
+     je .do_read_block
++    cmp al, 0x04
++    je .do_pci_read
+ 
+     mov esi, remote_got_msg
+     call print32
+@@ -1156,10 +1173,41 @@
+     call remote_send_readblock_reply
+     jmp .next_command
+ 
++.do_pci_read:
++    movzx eax, byte [RX_BUF_ADDR + 15]
++    mov [remote_pci_bus], eax
++    movzx eax, byte [RX_BUF_ADDR + 16]
++    mov [remote_pci_dev], eax
++    movzx eax, byte [RX_BUF_ADDR + 17]
++    mov [remote_pci_func], eax
++    movzx eax, byte [RX_BUF_ADDR + 18]
++    mov [remote_pci_reg], eax
++
++    mov ebx, [remote_pci_bus]
++    mov ecx, [remote_pci_dev]
++    mov edx, [remote_pci_func]
++    mov esi, [remote_pci_reg]
++    call pci_read32
++    mov [remote_pci_value], eax
++
++    mov esi, remote_pciread_msg
++    call print32
++    mov eax, [remote_pci_value]
++    call print_hex32
++    call emit_newline
++
++    call remote_send_pciread_reply
++    jmp .next_command
++
+ remote_addr:  dd 0
+ remote_value: dd 0
+ remote_count: dd 0
+ remote_frame_len: dd 0
++remote_pci_bus: dd 0
++remote_pci_dev: dd 0
++remote_pci_func: dd 0
++remote_pci_reg: dd 0
++remote_pci_value: dd 0
+ MAX_BLOCK_COUNT equ 256   ; 256 dwords = 1024 data bytes; total frame
+                           ; (14 hdr + 1 op + 4 addr + 2 count + 1024 data)
+                           ; = 1045 bytes, comfortably under the 1500-byte
+@@ -1371,6 +1419,32 @@
+     popa
+     ret
+ 
++remote_send_pciread_reply:
++    pusha
++    call remote_build_eth_header
++    mov byte [TX_BUF_ADDR+14], 0x84
++    mov al, [remote_pci_bus]
++    mov [TX_BUF_ADDR+15], al
++    mov al, [remote_pci_dev]
++    mov [TX_BUF_ADDR+16], al
++    mov al, [remote_pci_func]
++    mov [TX_BUF_ADDR+17], al
++    mov al, [remote_pci_reg]
++    mov [TX_BUF_ADDR+18], al
++    mov eax, [remote_pci_value]
++    mov [TX_BUF_ADDR+19], eax
++
++    mov edi, TX_BUF_ADDR+23
++    mov eax, TX_BUF_ADDR + 14 + 46
++    sub eax, edi
++    mov ecx, eax
++    xor al, al
++    rep stosb
++
++    call remote_send_frame
++    popa
++    ret
++
+ nic_dump_exit:
+     pop edx
+     pop ecx
+@@ -1434,6 +1508,7 @@
+ remote_eq_sp:     db ' = 0x', 0
+ remote_readblock_msg: db '  READBLK 0x', 0
+ remote_count_label:   db ' count=0x', 0
++remote_pciread_msg:   db '  PCIREAD = 0x', 0
+ 
+ rx_echo_prefix: db 'ECHO:', 0
+ rx_echo_prefix_len equ ($ - rx_echo_prefix) - 1

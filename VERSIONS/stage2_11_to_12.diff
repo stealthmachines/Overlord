@@ -1,0 +1,16 @@
+--- stage2_11.asm	2026-08-25 09:47:16.741116900 -0600
++++ stage2_12.asm	2026-08-25 09:47:16.751742700 -0600
+@@ -1326,6 +1326,13 @@
+     or  eax, 0x40000000
+ .rx_rearm_not_last:
+     mov [edi], eax
++    mov dword [edi+4], 0   ; BUG FIX (round 12): the original single-
++                            ; descriptor code always cleared this status
++                            ; field on every re-arm; the ring version only
++                            ; did it in one-time init, leaving stale NIC-
++                            ; written status on every slot's 2nd+ reuse --
++                            ; matches the exact observed hang threshold
++                            ; (burst of RX_RING_COUNT+1 = 5 frames)
+ 
+     inc dword [rx_cur]
+     mov eax, [rx_cur]

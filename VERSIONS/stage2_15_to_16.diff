@@ -1,0 +1,95 @@
+--- stage2_15.asm	2026-08-25 09:47:16.795411400 -0600
++++ stage2_16.asm	2026-08-25 09:47:16.803810200 -0600
+@@ -1278,6 +1278,24 @@
+     mov esi, remote_loop_hdr
+     call print32
+ 
++    ; round 16 fix: RCR (0x44) came back 0x00028F00 after reset this boot --
++    ; APM/AM/AB (bits 1-3) all clear, i.e. the receiver was configured to
++    ; accept NOTHING, not even our own unicast/broadcast. The comment this
++    ; replaces assumed RCR "already looked sane" post-reset based on rounds
++    ; 2-3 (0x0002CF0E, APM|AM|AB already set) and deliberately left it
++    ; alone -- that assumption doesn't hold on every reset. OR the accept
++    ; bits in explicitly, once, before RX is ever enabled below, instead of
++    ; trusting whatever the chip happened to reset to. Only the low nibble
++    ; is touched; the existing DMA-burst/FIFO-threshold bits are preserved.
++    mov ebp, [mmio_base]
++    mov eax, [ebp + 0x44]
++    or  eax, 0x0000000E        ; APM|AM|AB
++    mov [ebp + 0x44], eax
++    mov esi, rcr_fix_msg
++    call print32
++    call print_hex32
++    call emit_newline
++
+ .next_command:
+     ; ── Re-arm the RX descriptor: hand hardware a fresh empty buffer ──
+     mov edi, RX_DESC_ADDR
+@@ -1756,9 +1774,23 @@
+ 
+ ; Transmits whatever's currently sitting in TX_BUF_ADDR[0..FRAME_LEN-1] --
+ ; fill descriptor, ring the doorbell, poll for completion (bounded,
+-; already proven fast/instant on this real chip).
++; usually fast/instant on this real chip -- but round 16's real-hardware
++; use showed intermittent TX stalls the original single-shot version
++; silently swallowed: it fell through to .done and returned normally
++; even when the poll limit was hit and the OWN bit never actually
++; cleared, so that reply just vanished with zero diagnostic. RX kept
++; working fine every time (matches what was observed: "Command
++; received" printed for every incoming request, but replies only
++; landed some of the time). Fix: retry the whole re-arm+doorbell+poll
++; sequence up to TX_RETRY_LIMIT times -- a fresh descriptor arm and a
++; fresh doorbell ring gives the chip a clean shot even if the previous
++; attempt's DMA genuinely stalled -- and print a clear failure message
++; only if every attempt is exhausted, instead of failing silently.
++TX_RETRY_LIMIT equ 3
+ remote_send_frame:
+     pusha
++    mov ebx, TX_RETRY_LIMIT
++.attempt:
+     mov edi, TX_DESC_ADDR
+     mov eax, 0x80000000
+     or  eax, 0x40000000
+@@ -1786,6 +1818,12 @@
+     test eax, 0x80000000
+     jz .done
+     loop .poll_loop
++
++    ; poll limit hit, OWN bit never cleared -- this attempt failed
++    dec ebx
++    jnz .attempt
++    mov esi, tx_send_failed_msg
++    call print32
+ .done:
+     popa
+     ret
+@@ -1796,6 +1834,8 @@
+ ; this agent sends.
+ remote_send_frame_var:
+     pusha
++    mov ebx, TX_RETRY_LIMIT
++.attempt:
+     mov edi, TX_DESC_ADDR
+     mov eax, 0x80000000
+     or  eax, 0x40000000
+@@ -1823,6 +1863,11 @@
+     test eax, 0x80000000
+     jz .done
+     loop .poll_loop
++
++    dec ebx
++    jnz .attempt
++    mov esi, tx_send_failed_msg
++    call print32
+ .done:
+     popa
+     ret
+@@ -2247,6 +2292,8 @@
+ tx_payload_len equ ($ - tx_payload_str) - 1
+ 
+ remote_loop_hdr: db 10, '-- REMOTE COMMAND LOOP (persistent; PING/READ32/WRITE32) --', 10, 0
++rcr_fix_msg:     db 'RCR accept-bits forced (APM|AM|AB) -- now 0x', 0
++tx_send_failed_msg: db '  TX FAILED -- OWN bit never cleared after ', 0
+ remote_got_msg:  db '  Command received: ', 0
+ remote_read_msg:  db '  READ32  0x', 0
+ remote_write_msg: db '  WRITE32 0x', 0

@@ -1,0 +1,125 @@
+--- stage2_17.asm	2026-08-25 09:47:16.824143100 -0600
++++ stage2_18.asm	2026-08-25 09:47:16.835517000 -0600
+@@ -805,6 +805,8 @@
+ 
+     call disable_rxdvgate
+ 
++    call disable_aldps
++
+     call tx_test
+ 
+     ; remote_loop never returns -- once started, this boot image stays a
+@@ -1030,6 +1032,104 @@
+     popa
+     ret
+ 
++; =============================================================================
++; MDIO (PHY register) access via PHYAR (offset 0x60) -- the standard
++; RTL8169/8168 indirect PHY interface. Verified against the real Linux
++; r8169 driver source (r8169_main.c), not guessed:
++;   WRITE: PHYAR = 0x80000000 | (reg<<16) | data; poll until bit31 CLEARS
++;   READ:  PHYAR = (reg<<16);                    poll until bit31 SETS,
++;                                                  result = PHYAR & 0xFFFF
++; =============================================================================
++MDIO_POLL_LIMIT equ 1000000
++
++; CL = PHY register (0-31), DX = 16-bit value to write. No return value,
++; safe to wrap entirely in pusha/popa.
++mdio_write:
++    pusha
++    mov ebp, [mmio_base]
++    movzx eax, cl
++    shl eax, 16
++    or  eax, 0x80000000
++    movzx ecx, dx
++    or  eax, ecx
++    mov [ebp + 0x60], eax
++    mov ecx, MDIO_POLL_LIMIT
++.poll:
++    mov eax, [ebp + 0x60]
++    test eax, 0x80000000
++    jz .done
++    loop .poll
++.done:
++    popa
++    ret
++
++; CL = PHY register (0-31) -> AX = value read. Does NOT use pusha/popa
++; since EAX must escape as the return value -- same convention as
++; pci_read32/pci_write32 above.
++mdio_read:
++    push ebx
++    push ecx
++    push edx
++    push ebp
++    mov ebp, [mmio_base]
++    movzx eax, cl
++    shl eax, 16
++    mov [ebp + 0x60], eax
++    mov ecx, MDIO_POLL_LIMIT
++.poll:
++    mov eax, [ebp + 0x60]
++    test eax, 0x80000000
++    jnz .done
++    loop .poll
++.done:
++    and eax, 0xFFFF
++    pop ebp
++    pop edx
++    pop ecx
++    pop ebx
++    ret
++
++; =============================================================================
++; DISABLE_ALDPS -- RTL8168's PHY has its own power-saving feature
++; (Advanced Link Down Power Saving) living in PHY-specific MDIO registers,
++; set independently of anything do_reset/disable_rxdvgate touch (those
++; are MAC-level). Confirmed against real reference material: "if the
++; hardware is in ALDPS mode, the hardware may have no response for
++; accessing most registers" -- exactly the symptom seen on real hardware
++; here: fine right after boot, completely unresponsive (not just to one
++; opcode, to everything including PING) after a period of no traffic.
++; "For 8168 series, ALDPS would be disabled automatically when loading
++; firmware" -- true for a normal OS driver, but this bare-metal firmware
++; never loads Realtek's firmware blob, so it stays enabled unless
++; explicitly cleared here. Disabled by switching the PHY to extension
++; page 0x0A43 and clearing bit 2 of register 0x10 on that page.
++; =============================================================================
++disable_aldps:
++    pusha
++    mov esi, aldps_msg
++    call print32
++
++    mov cl, 0x1F
++    mov dx, 0x0A43
++    call mdio_write             ; select extension page 0x0A43
++
++    mov cl, 0x10
++    call mdio_read              ; ax = current reg 0x10 value
++    and ax, 0xFFFB              ; clear bit 2 (ALDPS enable)
++    mov dx, ax
++    mov cl, 0x10
++    call mdio_write             ; write it back
++
++    mov cl, 0x1F
++    mov dx, 0x0000
++    call mdio_write             ; restore default page
++
++    mov esi, aldps_done_msg
++    call print32
++
++    popa
++    ret
++
+ tx_test:
+     pusha
+ 
+@@ -2274,6 +2374,8 @@
+ busmaster_msg:      db 10, 'Forcing PCI COMMAND (Memory Space + Bus Master) enabled -- now = 0x', 0
+ before_reset_hdr:   db 10, '-- BEFORE RESET --', 10, 0
+ rxdvgate_msg:       db 10, 'Clearing RXDV_GATED_EN (MISC bit 19 @0xF0) -- unblocks RX at the PHY/MAC boundary...', 10, 0
++aldps_msg:          db 10, 'Disabling ALDPS (PHY page 0x0A43 reg0x10 bit2) -- prevents idle-link power-down...', 10, 0
++aldps_done_msg:     db '  ALDPS disabled.', 10, 0
+ after_reset_hdr:     db 10, '-- AFTER RESET --', 10, 0
+ reset_issuing_msg:   db 10, 'Issuing software reset (writing CmdReset=0x10 to ChipCmd @0x37)...', 10, 0
+ reset_done_msg:       db '  Reset completed. Poll iterations: 0x', 0
